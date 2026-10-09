@@ -1,16 +1,16 @@
 
-from flask import Flask, request, redirect, url_for, render_template_string, send_from_directory
+from flask import Flask, request, redirect, url_for, render_template_string, send_from_directory, session
 from pathlib import Path
 from datetime import datetime
 import json
 import os
+import secrets
 import requests
 
 app = Flask(__name__)
+BASE_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 
-BASE_DIR = Path(__file__).resolve().parent
-
-# Resend settings: configure these as environment variables
+# Configure these environment variables before deployment.
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 RESEND_TO_EMAIL = os.environ.get("RESEND_TO_EMAIL", "")
 RESEND_FROM_EMAIL = os.environ.get(
@@ -18,6 +18,8 @@ RESEND_FROM_EMAIL = os.environ.get(
     "Gajanand Telecom <onboarding@resend.dev>"
 )
 RESEND_API_URL = "https://api.resend.com/emails"
+
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
 
 PRODUCTS = [
     {"id": 1, "name": "U&i Earbuds", "category": "Audio", "image": "earbuds.jfif"},
@@ -29,14 +31,6 @@ PRODUCTS = [
     {"id": 7, "name": "U&i Charging Cable", "category": "Charging", "image": "cable.jfif"},
     {"id": 8, "name": "U&i Power Bank", "category": "Charging", "image": "powerbank.jfif"},
 ]
-
-# Session-based cart, so visitors have separate carts.
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "")
-if not app.secret_key:
-    # Development fallback only. Set FLASK_SECRET_KEY for deployment.
-    app.secret_key = os.urandom(32)
-
-from flask import session
 
 PAGE = """
 <!DOCTYPE html>
@@ -163,7 +157,6 @@ input, textarea, select {
 }
 textarea { min-height: 100px; resize: vertical; }
 .notice { background: #fff5c2; padding: 12px; border-radius: 7px; margin-bottom: 14px; }
-.empty { padding: 25px; text-align: center; background: white; border-radius: 10px; grid-column: 1 / -1; }
 footer {
     background: var(--black); color: white; text-align: center;
     padding: 25px 12px; margin-top: 35px; line-height: 1.8;
@@ -224,7 +217,7 @@ footer strong { color: var(--yellow); }
             <div class="product-image">
                 <img src="{{ url_for('product_image', filename=p.image) }}"
                      alt="{{ p.name }}" loading="lazy"
-                     onerror="this.onerror=null;this.src='/image/missing.jfif';">
+                     onerror="this.onerror=null;this.style.display='none';">
             </div>
             <div class="product-info">
                 <span class="category">{{ p.category }}</span>
@@ -276,7 +269,7 @@ footer strong { color: var(--yellow); }
     <p>Send your details and the products you are interested in.</p>
     {% if submitted %}
         <div class="notice">
-            Your enquiry was accepted by the email service. Check your Gmail inbox.
+            Your enquiry email was accepted by Resend. Your cart has been cleared.
         </div>
     {% endif %}
     <form action="{{ url_for('enquiry') }}" method="post">
@@ -318,7 +311,6 @@ function filterProducts() {
         card.style.display = matchesSearch && matchesCategory ? "flex" : "none";
     });
 }
-
 searchBox.addEventListener("input", filterProducts);
 filterButtons.forEach(button => {
     button.addEventListener("click", () => {
@@ -345,15 +337,9 @@ def save_cart(cart_data):
 @app.route("/image/<path:filename>")
 def product_image(filename):
     allowed_images = {
-        "theme.jfif",
-        "earbuds.jfif",
-        "neckband.jfif",
-        "headphones.jfif",
-        "speaker.jfif",
-        "smartwatch.jfif",
-        "charger.jfif",
-        "cable.jfif",
-        "powerbank.jfif",
+        "theme.jfif", "earbuds.jfif", "neckband.jfif",
+        "headphones.jfif", "speaker.jfif", "smartwatch.jfif",
+        "charger.jfif", "cable.jfif", "powerbank.jfif",
         "missing.jfif",
     }
 
@@ -458,14 +444,16 @@ def enquiry():
         "product": product_choice,
         "message": message,
         "cart": [
-            {"name": p["name"], "quantity": int(cart_data.get(str(p["id"]), 0))}
+            {
+                "name": p["name"],
+                "quantity": int(cart_data.get(str(p["id"]), 0))
+            }
             for p in PRODUCTS
             if int(cart_data.get(str(p["id"]), 0)) > 0
         ],
     }
 
-    # Save locally when the hosting platform has persistent storage.
-    # Some hosting services erase local files when restarting.
+    # Save enquiry locally where writable storage is available.
     try:
         enquiry_file = BASE_DIR / "enquiries.jsonl"
         with enquiry_file.open("a", encoding="utf-8") as file:
@@ -473,11 +461,12 @@ def enquiry():
     except OSError as error:
         print("Could not save enquiry locally:", error)
 
-    print("New Gajanand Telecom enquiry received.")
-
     if not RESEND_API_KEY or not RESEND_TO_EMAIL:
         print("Missing RESEND_API_KEY or RESEND_TO_EMAIL.")
-        return "Email is not configured. Please contact the shop owner.", 500
+        return (
+            "Email is not configured. Your cart has not been cleared. "
+            "Please contact the shop owner."
+        ), 500
 
     cart_details = "\n".join(
         f"- {item['name']} x {item['quantity']}"
@@ -507,7 +496,6 @@ Customer message:
         "text": email_body,
     }
 
-    # Send using Resend's HTTP API via requests.
     try:
         response = requests.post(
             RESEND_API_URL,
@@ -522,8 +510,8 @@ Customer message:
         if not response.ok:
             print("Resend error:", response.status_code, response.text[:1000])
             return (
-                "Your enquiry was saved, but the email could not be sent. "
-                "Please try again later."
+                "Your enquiry was saved, but email sending failed. "
+                "Your cart has not been cleared. Please try again later."
             ), 502
 
         print("Resend accepted the enquiry email:", response.text[:500])
@@ -532,8 +520,11 @@ Customer message:
         print("Resend connection error:", str(error))
         return (
             "Your enquiry was saved, but email sending failed. "
-            "Please try again later."
+            "Your cart has not been cleared. Please try again later."
         ), 502
+
+    # IMPORTANT: Clear this visitor's cart after successful email acceptance.
+    session.pop("cart", None)
 
     return redirect(url_for("home", submitted="1") + "#enquiry")
 
